@@ -1,0 +1,85 @@
+name: 解压缩包
+
+on:
+  workflow_dispatch:
+    inputs:
+      delete_zip:
+        description: '解压后删除原始 ZIP 压缩包'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  unzip-all:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 批量解压所有 ZIP 文件（递归，只去掉最外层包装）
+        env:
+          DELETE_ZIP: ${{ inputs.delete_zip }}
+        run: |
+          set -euo pipefail
+
+          mapfile -d '' -t zipfiles < <(find . -type f -name "*.zip" -not -path "./.git/*" -print0)
+
+          if [ "${#zipfiles[@]}" -eq 0 ]; then
+            echo "未找到任何 ZIP 文件"
+            exit 0
+          fi
+
+          for zipfile in "${zipfiles[@]}"; do
+            zipdir=$(dirname "$zipfile")
+            filename=$(basename "$zipfile" .zip)
+
+            tmpdir=$(mktemp -d)
+            # 解压时排除 .github 目录，避免覆盖/冲突仓库的 Actions 配置
+            unzip -q "$zipfile" -x ".github/*" -d "$tmpdir"
+
+            if [ -z "$(ls -A "$tmpdir" 2>/dev/null || true)" ]; then
+              echo "警告：$zipfile 解压后为空，跳过"
+              rm -rf "$tmpdir"
+              continue
+            fi
+
+            shopt -s dotglob
+            items=("$tmpdir"/*)
+            shopt -u dotglob
+
+            if [ "${#items[@]}" -eq 1 ] && [ -d "${items[0]}" ]; then
+              # 用 cp -r 递归合并，遇到同名非空目录不会报错
+              cp -r "${items[0]}"/. "$zipdir/"
+            else
+              shopt -s dotglob
+              cp -r "$tmpdir"/* "$zipdir/"
+              shopt -u dotglob
+            fi
+
+            rm -rf "$tmpdir"
+            echo "✓ 已解压 $zipfile -> $zipdir"
+
+            # 解压成功后再删除压缩包
+            if [ "$DELETE_ZIP" = "true" ]; then
+              rm -f "$zipfile"
+              echo "已删除压缩包 $zipfile"
+            fi
+          done
+
+      - name: 查看解压后的文件结构
+        run: |
+          echo "根目录文件结构："
+          ls -la
+
+      - name: 提交解压后的文件回仓库
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "自动解压所有 ZIP 文件" || echo "没有变化需要提交"
+          git push
