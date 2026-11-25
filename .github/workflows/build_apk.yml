@@ -1,65 +1,86 @@
-# Build APKs for Kiwi Browser Next
-name: 'Any branch: Build APK'
+name: Build Kiwi APK (Standalone)
 
-# Controls when the action will run. Triggers the workflow on pull request events or manual trigger
 on:
-  pull_request:
-    branches:
-      - kiwi
   workflow_dispatch:
+    inputs:
+      target_cpu:
+        description: 'Target architecture'
+        required: true
+        default: 'arm64'
+        type: choice
+        options:
+          - arm64
+          - arm
+          - x64
+          - x86
 
-concurrency: build_test_apk
-
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
   build:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
+    # 建议使用 16核+ / 32GB+ 内存 / 150GB+ SSD 的自托管 Runner（或大规格主机）
+    runs-on: self-hosted
+    env:
+      CHROMIUM_DIR: ${{ github.workspace }}/chromium
+      CHROMIUM_TAG: '105.0.5195.24'
 
     steps:
-      - name: Get branch name
-        id: branch-name
-        uses: tj-actions/branch-names@v4.8
-    
-      - name: Building APK (if manually triggered)
-        if: github.event_name != 'pull_request'
-        run: curl --http1.0 --no-buffer -s 'http://longbuild.find.kiwi/build_apk.php?build_key=${{ secrets.BUILD_KEY }}&git_user=${{ github.repository_owner }}&git_repository=${{ github.event.repository.name }}&git_runid=${{ github.run_id }}&git_branch=${{ steps.branch-name.outputs.current_branch }}'
-
-      # Variables are from: https://docs.github.com/en/developers/webhooks-and-events/webhooks/webhook-events-and-payloads#pullrequestevent
-      # and https://docs.github.com/en/rest/reference/pulls
-      - name: Building APK (if pull request)
-        if: github.event_name == 'pull_request'
-        run: curl --http1.0 --no-buffer -s 'http://longbuild.find.kiwi/build_apk.php?build_key=${{ secrets.BUILD_KEY }}&git_user=${{ github.event.pull_request.head.repo.owner.login }}&git_repository=${{ github.event.pull_request.head.repo.name }}&git_runid=${{ github.run_id }}&git_branch=${{ github.event.pull_request.head.ref }}'
-
-      - name: Downloading APK
-        if: github.event_name != 'pull_request'
-        run: wget -q 'https://build.find.kiwi/apks/${{ github.run_id }}/out.apk'
-
-      - name: Creating release
-        if: github.event_name != 'pull_request'
-        id: create_release
-        uses: actions/create-release@v1.1.4
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Checkout Kiwi overlay repo
+        uses: actions/checkout@v4
         with:
-          tag_name: ${{ github.run_id }}
-          release_name: Test build ${{ github.run_id }} initiated by ${{ github.actor }}
-          draft: true
-          prerelease: true
-          body: |
-            This is a test build initiated by ${{ github.actor }}.
+          path: kiwi-overlay
 
-      - name: Uploading test apk (arm64)
-        if: github.event_name != 'pull_request'
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install depot_tools
+        run: |
+          if [ ! -d "${{ github.workspace }}/depot_tools" ]; then
+            git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "${{ github.workspace }}/depot_tools"
+          fi
+          echo "${{ github.workspace }}/depot_tools" >> $GITHUB_PATH
+
+      - name: Sync Chromium ${{ env.CHROMIUM_TAG }} source
+        run: |
+          mkdir -p "$CHROMIUM_DIR"
+          cd "$CHROMIUM_DIR"
+          if [ ! -d "src" ]; then
+            fetch --nohooks android
+          fi
+          cd src
+          git fetch --tags origin
+          git checkout -f "tags/${{ env.CHROMIUM_TAG }}"
+          gclient sync -D --with_branch_heads --with_tags --nohooks
+
+      - name: Overlay Kiwi files onto Chromium src
+        run: |
+          rsync -a --exclude='.git' --exclude='.github' --exclude='.build' \
+            "${{ github.workspace }}/kiwi-overlay/" "$CHROMIUM_DIR/src/"
+
+      - name: Install build dependencies and run hooks
+        run: |
+          cd "$CHROMIUM_DIR/src"
+          sudo ./build/install-build-deps.sh --no-prompt --android
+          gclient runhooks
+
+      - name: Generate keystore and configure args.gn
+        run: |
+          OUT_DIR="$CHROMIUM_DIR/src/out/android_${{ inputs.target_cpu }}"
+          mkdir -p "$OUT_DIR"
+          if [ ! -f "$CHROMIUM_DIR/src/keystore.jks" ]; then
+            keytool -genkey -v -keystore "$CHROMIUM_DIR/src/keystore.jks" \
+              -alias dev -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass public_password -keypass public_password \
+              -dname "cn=Kiwi Browser, ou=Actions, o=Kiwi, c=GitHub"
+          fi
+          cp "${{ github.workspace }}/kiwi-overlay/.build/production_build_reference/args.gn" "$OUT_DIR/args.gn"
+          sed -i 's/^target_cpu = .*/target_cpu = "${{ inputs.target_cpu }}"/' "$OUT_DIR/args.gn"
+          sed -i 's/^cc_wrapper = .*/# cc_wrapper disabled/' "$OUT_DIR/args.gn"
+
+      - name: Build APK with gn and autoninja
+        run: |
+          cd "$CHROMIUM_DIR/src"
+          OUT_REL="out/android_${{ inputs.target_cpu }}"
+          gn gen "$OUT_REL"
+          autoninja -C "$OUT_REL" chrome_public_apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
         with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./out.apk
-          asset_name: ${{ github.repository_owner }}.${{ github.event.repository.name }}.${{ steps.branch-name.outputs.current_branch }}.${{ github.run_id }}-unofficial-arm64.apk
-          asset_content_type: application/vnd.android.package-archive
-
-      - name: Displaying download link
-        run: echo "Build can be downloaded at https://build.find.kiwi/apks/${{ github.run_id }}/out.apk"
-
+          name: kiwi-${{ inputs.target_cpu }}-apk
+          path: ${{ env.CHROMIUM_DIR }}/src/out/android_${{ inputs.target_cpu }}/apks/ChromePublic.apk
