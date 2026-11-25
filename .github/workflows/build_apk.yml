@@ -1,4 +1,4 @@
-name: Build Kiwi APK (Standalone)
+name: Build Kiwi APK (Chromium 105)
 
 on:
   workflow_dispatch:
@@ -16,19 +16,29 @@ on:
 
 jobs:
   build:
-    # 建议使用 16核+ / 32GB+ 内存 / 150GB+ SSD 的自托管 Runner（或大规格主机）
+    # 必须使用 150GB+ 可用磁盘、16GB+ 内存的 self-hosted Runner（免费 ubuntu-latest 磁盘会爆）
     runs-on: self-hosted
+    container:
+      image: ubuntu:20.04
+      options: --privileged
+
     env:
+      DEBIAN_FRONTEND: noninteractive
       CHROMIUM_DIR: ${{ github.workspace }}/chromium
       CHROMIUM_TAG: '105.0.5195.24'
 
     steps:
+      - name: Install base tools in container
+        run: |
+          apt-get update
+          apt-get install -y sudo git curl wget python3 python-is-python3 rsync lsb-release openjdk-8-jdk-headless
+
       - name: Checkout Kiwi overlay repo
         uses: actions/checkout@v4
         with:
           path: kiwi-overlay
 
-      - name: Install depot_tools
+      - name: Setup depot_tools
         run: |
           if [ ! -d "${{ github.workspace }}/depot_tools" ]; then
             git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "${{ github.workspace }}/depot_tools"
@@ -52,24 +62,41 @@ jobs:
           rsync -a --exclude='.git' --exclude='.github' --exclude='.build' \
             "${{ github.workspace }}/kiwi-overlay/" "$CHROMIUM_DIR/src/"
 
-      - name: Install build dependencies and run hooks
+      - name: Install Chromium build deps and run hooks
         run: |
           cd "$CHROMIUM_DIR/src"
-          sudo ./build/install-build-deps.sh --no-prompt --android
+          ./build/install-build-deps.sh --no-prompt --android
           gclient runhooks
 
-      - name: Generate keystore and configure args.gn
+      - name: Prepare keystore and args.gn
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
           OUT_DIR="$CHROMIUM_DIR/src/out/android_${{ inputs.target_cpu }}"
           mkdir -p "$OUT_DIR"
-          if [ ! -f "$CHROMIUM_DIR/src/keystore.jks" ]; then
-            keytool -genkey -v -keystore "$CHROMIUM_DIR/src/keystore.jks" \
-              -alias dev -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass public_password -keypass public_password \
-              -dname "cn=Kiwi Browser, ou=Actions, o=Kiwi, c=GitHub"
+
+          # args.gn 默认读取 ../../keystore.jks（即 src/keystore.jks）
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$CHROMIUM_DIR/src/keystore.jks"
+            ALIAS="${KEY_ALIAS:-dev}"
+            PASS="${KEYSTORE_PASSWORD:-public_password}"
+          else
+            ALIAS="dev"
+            PASS="public_password"
+            if [ ! -f "$CHROMIUM_DIR/src/keystore.jks" ]; then
+              keytool -genkey -v -keystore "$CHROMIUM_DIR/src/keystore.jks" \
+                -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
+                -storepass "$PASS" -keypass "$PASS" \
+                -dname "cn=Kiwi Browser, ou=Actions, o=Kiwi, c=GitHub"
+            fi
           fi
+
           cp "${{ github.workspace }}/kiwi-overlay/.build/production_build_reference/args.gn" "$OUT_DIR/args.gn"
           sed -i 's/^target_cpu = .*/target_cpu = "${{ inputs.target_cpu }}"/' "$OUT_DIR/args.gn"
+          sed -i "s/^android_keystore_name = .*/android_keystore_name = \"$ALIAS\"/" "$OUT_DIR/args.gn"
+          sed -i "s/^android_keystore_password = .*/android_keystore_password = \"$PASS\"/" "$OUT_DIR/args.gn"
           sed -i 's/^cc_wrapper = .*/# cc_wrapper disabled/' "$OUT_DIR/args.gn"
 
       - name: Build APK with gn and autoninja
